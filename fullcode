@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Mr. CapFree"
 #property link      "https://www.mrCapFree.com"
-#property version   "1.00"
+#property version   "1.01"
 
 #include <Trade\Trade.mqh>
 CTrade              trade;
@@ -161,6 +161,10 @@ int OnInit()
    SpreadArraySize = (EAModeFlag == 0) ? DefaultSpreadPeriod : 3; // if EAModeFlag == 0, then DefaultSpreadPeriod else 3
    
    ArrayResize(SpreadHistoryArray, SpreadArraySize);
+
+   // Initialize spread history array to avoid zeros on first ticks
+   for(int i=0; i<SpreadArraySize; i++)
+      SpreadHistoryArray[i] = AverageSpread;
    
    MaxAllowedSpread = NormalizeDouble((MaxSpread * _Point), _Digits);
    
@@ -176,6 +180,51 @@ void OnDeinit(const int reason)
 {
    //---
    
+}
+//+------------------------------------------------------------------+
+//| Helper: open pending order with MqlTradeRequest/OrderSend        |
+//+------------------------------------------------------------------+
+bool OpenPendingOrder(ENUM_ORDER_TYPE type, string symbol, double volume, double price, double sl, double tp, string comment, ulong &out_ticket)
+{
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action   = TRADE_ACTION_PENDING;           // abrir ordem pendente
+   request.symbol   = symbol;
+   request.volume   = volume;
+   request.type     = type;                           // ORDER_TYPE_BUY_STOP ou SELL_STOP
+   request.price    = price;
+   request.sl       = sl;
+   request.tp       = tp;
+   request.deviation= Slippage;                       // input Slippage
+   request.magic    = InpMagic;
+   request.comment  = comment;
+   request.type_filling = ORDER_FILLING_RETURN;      // mais permissivo no tester
+   request.type_time    = ORDER_TIME_GTC;
+
+   if(!OrderSend(request, result))
+   {
+      int err = GetLastError();
+      PrintFormat("OrderSend() failed to submit request. errno=%d", err);
+      return false;
+   }
+
+   PrintFormat("OrderSend() result: retcode=%d request_price=%.8f result_order=%I64u comment=%s",
+               result.retcode, price, result.order, result.comment);
+
+   // Consider common successful retcodes (PLACED / DONE)
+   if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED || result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+   {  
+      out_ticket = (ulong)result.order;
+      return true;
+   }
+   else
+   {
+      PrintFormat("OrderSend failed. retcode=%d result.comment=%s", result.retcode, result.comment);
+      return false;
+   }
 }
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
@@ -244,6 +293,10 @@ void OnTick()
    
    double Ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double Bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // DEBUG: main values
+   PrintFormat("DEBUG: Ask=%.8f Bid=%.8f AvgSpread=%.8f MaxAllowed=%.8f FreeMargin=%.2f Leverage=%d",
+               Ask, Bid, AverageSpread, MaxAllowedSpread, AccountInfoDouble(ACCOUNT_MARGIN_FREE), (int)AccountInfoInteger(ACCOUNT_LEVERAGE));
    
    // Update spread history array
    double newSpread = NormalizeDouble(Ask - Bid, _Digits);
@@ -461,19 +514,34 @@ void OnTick()
             double marginRequired = 0.0;
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
                
-            if(OrderCalcMargin(ORDER_TYPE_BUY_STOP, _Symbol, CalculatedLotSize, ask, marginRequired) && AccountInfoDouble(ACCOUNT_MARGIN_FREE) > marginRequired){
+            bool okMargin = OrderCalcMargin(ORDER_TYPE_BUY_STOP, _Symbol, CalculatedLotSize, ask, marginRequired);
+            PrintFormat("OrderCalcMargin returned %s  marginReq=%.2f freeMargin=%.2f", okMargin ? "true":"false", marginRequired, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+
+            if(okMargin && AccountInfoDouble(ACCOUNT_MARGIN_FREE) > marginRequired){
          
+               double stop_level = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
                double orderDist  = MathMax(MathMax(AdjustedOrderDistance, MinFreezeDistance), MinStopDistance);
+               orderDist = MathMax(orderDist, stop_level + _Point); // force minimum respecting broker stop level
                double orderPrice = NormalizeDouble(ask + orderDist, _Digits);
                double orderSL    = (OpenBuyCount > 0 
                                    ? CurrentBuySL
                                    : NormalizeDouble(orderPrice - CalculatedStopLoss, _Digits));
                   
-               if(trade.OrderOpen(_Symbol, ORDER_TYPE_BUY_STOP, CalculatedLotSize, orderPrice, ask,orderSL,NewOrderTakeProfit, 0,0, OrderCommentText))
+               ulong placedTicket = 0;
+               if(OpenPendingOrder(ORDER_TYPE_BUY_STOP, _Symbol, CalculatedLotSize, orderPrice, orderSL, NewOrderTakeProfit, OrderCommentText, placedTicket))
                {
                   LastBuyOrderTime = (int)TimeCurrent();
                   LastOrderTime    = (int)TimeCurrent();
+                  PrintFormat("BUY_STOP placed ticket=%I64u price=%.8f lots=%.2f SL=%.8f", placedTicket, orderPrice, CalculatedLotSize, orderSL);
                }
+               else
+               {
+                  PrintFormat("BUY_STOP failed price=%.8f lots=%.2f SL=%.8f", orderPrice, CalculatedLotSize, orderSL);
+               }
+            }
+            else
+            {
+               Print("Not enough margin or OrderCalcMargin failed for BUY_STOP");
             }
          }
       }
@@ -502,19 +570,33 @@ void OnTick()
             double marginRequired = 0.0;
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
                
-            if (OrderCalcMargin(ORDER_TYPE_SELL_STOP, _Symbol, CalculatedLotSize, bid, marginRequired) &&
-                AccountInfoDouble(ACCOUNT_MARGIN_FREE) > marginRequired)
+            bool okMargin = OrderCalcMargin(ORDER_TYPE_SELL_STOP, _Symbol, CalculatedLotSize, bid, marginRequired);
+            PrintFormat("OrderCalcMargin returned %s  marginReq=%.2f freeMargin=%.2f", okMargin ? "true":"false", marginRequired, AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+
+            if (okMargin && AccountInfoDouble(ACCOUNT_MARGIN_FREE) > marginRequired)
             {
+               double stop_level = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
                double orderDist  = MathMax(MathMax(AdjustedOrderDistance, MinFreezeDistance), MinStopDistance);
+               orderDist = MathMax(orderDist, stop_level + _Point); // force minimum respecting broker stop level
                double orderPrice = NormalizeDouble(bid - orderDist, _Digits);
                double orderSL    = (OpenSellCount > 0) 
                                    ? CurrentSellSL 
                                    : NormalizeDouble(orderPrice + CalculatedStopLoss, _Digits);
-               if (trade.OrderOpen(_Symbol, ORDER_TYPE_SELL_STOP, CalculatedLotSize, orderPrice, bid, orderSL, NewOrderTakeProfit, 0,0, OrderCommentText))
+               ulong placedTicket = 0;
+               if(OpenPendingOrder(ORDER_TYPE_SELL_STOP, _Symbol, CalculatedLotSize, orderPrice, orderSL, NewOrderTakeProfit, OrderCommentText, placedTicket))
                {
                   LastSellOrderTime = (int)TimeCurrent();
                   LastOrderTime     = (int)TimeCurrent();
+                  PrintFormat("SELL_STOP placed ticket=%I64u price=%.8f lots=%.2f SL=%.8f", placedTicket, orderPrice, CalculatedLotSize, orderSL);
                }
+               else
+               {
+                  PrintFormat("SELL_STOP failed price=%.8f lots=%.2f SL=%.8f", orderPrice, CalculatedLotSize, orderSL);
+               }
+            }
+            else
+            {
+               Print("Not enough margin or OrderCalcMargin failed for SELL_STOP");
             }
          }
       }
@@ -578,3 +660,4 @@ double calcLots(double slPoints)
 
    return lots;
 }
+
